@@ -315,4 +315,71 @@ router.post('/:workshopId/sessions/:sessionId/attendance', requireLogin, require
   }
 });
 
+// GET /workshops/:workshopId/attendance/summary
+// Only the workshop owner may see attendee attendance information.
+// Count each attendee only for sessions belonging to the SAME workshop.
+router.get('/:workshopId/attendance/summary', requireLogin, requireOrganizer, async (req, res, next) => {
+  const workshopId = Number(req.params.workshopId);
+  if (!Number.isInteger(workshopId) || workshopId < 1 || workshopId > 2147483647) {
+    return res.status(400).json({ code: 'INVALID_WORKSHOP_ID', error: 'workshopId must be a positive integer.' });
+  }
+
+  try {
+    const { rows: workshops } = await pool.query(
+      'SELECT workshop_id, title, organizer_id FROM public.workshops WHERE workshop_id = $1',
+      [workshopId]
+    );
+    if (!workshops.length) {
+      return res.status(404).json({ code: 'WORKSHOP_NOT_FOUND', error: 'Workshop not found.' });
+    }
+    if (workshops[0].organizer_id !== req.user.userId) {
+      return res.status(403).json({
+        code: 'NOT_WORKSHOP_OWNER',
+        error: 'Only the workshop organizer can view the attendance summary.'
+      });
+    }
+
+    const { rows: counts } = await pool.query(
+      'SELECT COUNT(*)::int AS total_sessions FROM public.sessions WHERE workshop_id = $1',
+      [workshopId]
+    );
+    const totalSessions = counts[0].total_sessions;
+
+    const { rows: attendees } = await pool.query(
+      `SELECT r.registration_id, r.attendee_id, p.name AS attendee_name,
+              COUNT(DISTINCT s.session_id)::int AS attended_sessions
+       FROM public.registrations r
+       JOIN public.profiles p ON p.id = r.attendee_id
+       LEFT JOIN public.attendance a ON a.registration_id = r.registration_id
+       LEFT JOIN public.sessions s
+         ON s.session_id = a.session_id AND s.workshop_id = r.workshop_id
+       WHERE r.workshop_id = $1
+       GROUP BY r.registration_id, r.attendee_id, p.name
+       ORDER BY p.name ASC, r.registration_id ASC`,
+      [workshopId]
+    );
+
+    return res.json({
+      workshopId,
+      workshopTitle: workshops[0].title,
+      totalSessions,
+      registeredAttendees: attendees.length,
+      // Percentages use all created sessions, including future ones. They are
+      // provisional until the workshop is complete. No sessions => null, not 0%.
+      attendees: attendees.map(row => ({
+        registrationId: row.registration_id,
+        attendeeId: row.attendee_id,
+        attendeeName: row.attendee_name,
+        attendedSessions: row.attended_sessions,
+        totalSessions,
+        attendancePercentage: totalSessions
+          ? Math.round((row.attended_sessions / totalSessions) * 1000) / 10
+          : null
+      }))
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 module.exports = router;
