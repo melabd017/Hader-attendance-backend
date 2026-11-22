@@ -120,4 +120,94 @@ router.post('/:workshopId/sessions', requireLogin, requireOrganizer, async (req,
   }
 });
 
+// PATCH /workshops/:workshopId/sessions/:sessionId/checkin
+// Only the workshop owner can OPEN or CLOSE check-in.
+// This controls the check-in window, not individual attendee attendance records.
+router.patch('/:workshopId/sessions/:sessionId/checkin', requireLogin, requireOrganizer, async (req, res, next) => {
+  const workshopId = Number(req.params.workshopId);
+  const sessionId = req.params.sessionId;
+
+  if (!Number.isInteger(workshopId) || workshopId < 1 || workshopId > 2147483647 ||
+      !/^[1-9]\d*$/.test(sessionId) || sessionId.length > 18) {
+    return res.status(400).json({ code: 'INVALID_ID', error: 'Invalid workshop or session ID.' });
+  }
+
+  const status = req.body?.status;
+  if (status !== 'open' && status !== 'closed') {
+    return res.status(400).json({
+      code: 'INVALID_STATUS',
+      error: 'JSON body must contain status: "open" or "closed".'
+    });
+  }
+
+  let client;
+  let transactionStarted = false;
+  try {
+    client = await pool.connect();
+    await client.query('BEGIN');
+    transactionStarted = true;
+
+    // Check that the session belongs to this workshop; lock it against
+    // concurrent status changes.
+    const { rows } = await client.query(
+      `SELECT s.session_id, s.checkin_status, w.organizer_id
+       FROM public.sessions s
+       JOIN public.workshops w ON w.workshop_id = s.workshop_id
+       WHERE s.session_id = $1 AND w.workshop_id = $2
+       FOR UPDATE OF s`,
+      [sessionId, workshopId]
+    );
+
+    if (!rows.length) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(404).json({ code: 'SESSION_NOT_FOUND', error: 'Session not found in this workshop.' });
+    }
+
+    if (rows[0].organizer_id !== req.user.userId) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(403).json({ code: 'NOT_WORKSHOP_OWNER', error: 'Only this workshop organizer can change check-in.' });
+    }
+
+    if (rows[0].checkin_status === status) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(409).json({ code: 'STATUS_UNCHANGED', error: 'Check-in is already ' + status + '.' });
+    }
+
+    const updated = await client.query(
+      `UPDATE public.sessions
+       SET checkin_status = $1
+       WHERE session_id = $2
+       RETURNING session_id, workshop_id, checkin_status`,
+      [status, sessionId]
+    );
+
+    await client.query('COMMIT');
+    transactionStarted = false;
+
+    console.log(JSON.stringify({
+      event: 'checkin_status_changed',
+      workshopId,
+      sessionId,
+      status,
+      userId: req.user.userId
+    }));
+
+    return res.json({
+      sessionId: updated.rows[0].session_id,
+      workshopId: updated.rows[0].workshop_id,
+      checkinStatus: updated.rows[0].checkin_status
+    });
+  } catch (error) {
+    if (transactionStarted && client) {
+      await client.query('ROLLBACK').catch(() => {});
+    }
+    next(error);
+  } finally {
+    if (client) client.release();
+  }
+});
+
 module.exports = router;
