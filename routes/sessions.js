@@ -210,4 +210,109 @@ router.patch('/:workshopId/sessions/:sessionId/checkin', requireLogin, requireOr
   }
 });
 
+// POST /workshops/:workshopId/sessions/:sessionId/attendance
+// An organizer marks a REGISTERED attendee present while check-in is OPEN.
+// Requires { "registrationId": number }. Enforces ownership, matching workshop,
+// and one check-in per registration per session.
+router.post('/:workshopId/sessions/:sessionId/attendance', requireLogin, requireOrganizer, async (req, res, next) => {
+  const workshopId = Number(req.params.workshopId);
+  const sessionId = req.params.sessionId;
+  const registrationId = req.body?.registrationId;
+
+  if (!Number.isInteger(workshopId) || workshopId < 1 || workshopId > 2147483647 ||
+      !/^[1-9]\d*$/.test(sessionId) || sessionId.length > 18) {
+    return res.status(400).json({ code: 'INVALID_ID', error: 'Invalid workshop or session ID.' });
+  }
+  if (!Number.isInteger(registrationId) || registrationId < 1 || registrationId > 2147483647) {
+    return res.status(400).json({ code: 'INVALID_REGISTRATION_ID', error: 'registrationId must be a positive integer.' });
+  }
+
+  let client;
+  let inTransaction = false;
+  try {
+    client = await pool.connect();
+    await client.query('BEGIN');
+    inTransaction = true;
+
+    // Locking the session prevents a concurrent check-in CLOSE from racing this insert.
+    const { rows: sessions } = await client.query(
+      `SELECT s.session_id, s.checkin_status, w.organizer_id
+       FROM public.sessions s
+       JOIN public.workshops w ON w.workshop_id = s.workshop_id
+       WHERE s.session_id = $1 AND s.workshop_id = $2
+       FOR UPDATE OF s`,
+      [sessionId, workshopId]
+    );
+
+    if (!sessions.length) {
+      await client.query('ROLLBACK');
+      inTransaction = false;
+      return res.status(404).json({ code: 'SESSION_NOT_FOUND', error: 'Session not found in this workshop.' });
+    }
+
+    if (sessions[0].organizer_id !== req.user.userId) {
+      await client.query('ROLLBACK');
+      inTransaction = false;
+      return res.status(403).json({ code: 'NOT_WORKSHOP_OWNER', error: 'Only the workshop organizer can mark attendance.' });
+    }
+
+    if (sessions[0].checkin_status !== 'open') {
+      await client.query('ROLLBACK');
+      inTransaction = false;
+      return res.status(409).json({ code: 'CHECKIN_CLOSED', error: 'Open session check-in before marking attendance.' });
+    }
+
+    // Never trust a registrationId by itself: it must belong to this workshop.
+    const { rows: registrations } = await client.query(
+      'SELECT attendee_id FROM public.registrations WHERE registration_id = $1 AND workshop_id = $2',
+      [registrationId, workshopId]
+    );
+    if (!registrations.length) {
+      await client.query('ROLLBACK');
+      inTransaction = false;
+      return res.status(404).json({ code: 'REGISTRATION_NOT_FOUND', error: 'No matching registration for this workshop.' });
+    }
+
+    // The database UNIQUE(session_id, registration_id) makes this safe even
+    // if the same request arrives twice. No duplicate attendance rows.
+    const result = await client.query(
+      `INSERT INTO public.attendance (session_id, registration_id, checked_in_by)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (session_id, registration_id) DO NOTHING
+       RETURNING attendance_id, session_id, registration_id, checked_in_at`,
+      [sessionId, registrationId, req.user.userId]
+    );
+
+    if (!result.rows.length) {
+      await client.query('ROLLBACK');
+      inTransaction = false;
+      return res.status(409).json({ code: 'ALREADY_CHECKED_IN', error: 'This attendee is already marked present for the session.' });
+    }
+
+    await client.query('COMMIT');
+    inTransaction = false;
+    const attendance = result.rows[0];
+
+    console.log(JSON.stringify({
+      event: 'attendance_checked_in',
+      workshopId, sessionId, registrationId,
+      userId: req.user.userId
+    }));
+
+    return res.status(201).json({
+      attendanceId: attendance.attendance_id,
+      sessionId: attendance.session_id,
+      registrationId: attendance.registration_id,
+      attendeeId: registrations[0].attendee_id,
+      checkedInAt: attendance.checked_in_at,
+      status: 'present'
+    });
+  } catch (error) {
+    if (inTransaction && client) await client.query('ROLLBACK').catch(() => {});
+    next(error);
+  } finally {
+    if (client) client.release();
+  }
+});
+
 module.exports = router;
