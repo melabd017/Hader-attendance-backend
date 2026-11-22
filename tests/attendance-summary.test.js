@@ -61,6 +61,10 @@ app.use((err, req, res, next) => {
 
 async function requestSummary() {
   const server = app.listen(0, '127.0.0.1');
+  await new Promise((resolve, reject) => {
+    server.once('listening', resolve);
+    server.once('error', reject);
+  });
   try {
     const url = 'http://127.0.0.1:' + server.address().port
       + '/workshops/1/attendance/summary';
