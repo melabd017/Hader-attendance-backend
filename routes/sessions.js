@@ -382,4 +382,63 @@ router.get('/:workshopId/attendance/summary', requireLogin, requireOrganizer, as
   }
 });
 
+// GET /workshops/:workshopId/sessions
+// The workshop's organizer or a registered attendee can list its sessions.
+// Only basic session data is returned; individual attendance stays private.
+router.get('/:workshopId/sessions', requireLogin, async (req, res, next) => {
+  const workshopId = Number(req.params.workshopId);
+  if (!Number.isInteger(workshopId) || workshopId < 1 || workshopId > 2147483647) {
+    return res.status(400).json({ code: 'INVALID_WORKSHOP_ID', error: 'workshopId must be a positive integer.' });
+  }
+
+  try {
+    const { rows: workshops } = await pool.query(
+      'SELECT workshop_id, organizer_id FROM public.workshops WHERE workshop_id = $1',
+      [workshopId]
+    );
+    if (!workshops.length) {
+      return res.status(404).json({ code: 'WORKSHOP_NOT_FOUND', error: 'Workshop not found.' });
+    }
+
+    const ownsWorkshop = req.user.role === 'organizer'
+      && workshops[0].organizer_id === req.user.userId;
+
+    if (!ownsWorkshop) {
+      // Avoid exposing private workshop sessions to other organizers or
+      // attendees who are not registered for this workshop.
+      if (req.user.role !== 'attendee') {
+        return res.status(403).json({ code: 'FORBIDDEN', error: 'You cannot view these workshop sessions.' });
+      }
+      const { rows: registrations } = await pool.query(
+        'SELECT 1 FROM public.registrations WHERE workshop_id = $1 AND attendee_id = $2 LIMIT 1',
+        [workshopId, req.user.userId]
+      );
+      if (!registrations.length) {
+        return res.status(403).json({ code: 'NOT_REGISTERED', error: 'Register for this workshop to view its sessions.' });
+      }
+    }
+
+    const { rows: sessions } = await pool.query(
+      `SELECT session_id, workshop_id, title, start_time, end_time, checkin_status
+       FROM public.sessions
+       WHERE workshop_id = $1
+       ORDER BY start_time, session_id`,
+      [workshopId]
+    );
+
+    return res.json({
+      workshopId,
+      sessions: sessions.map(s => ({
+        sessionId: s.session_id,
+        title: s.title,
+        startTime: s.start_time,
+        endTime: s.end_time,
+        checkinStatus: s.checkin_status
+      }))
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 module.exports = router;
