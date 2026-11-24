@@ -3,7 +3,8 @@
 // Usage: node scripts/build-lambda.js
 const fs = require('fs');
 const path = require('path');
-const archiver = require('archiver');
+// Archiver v8 exports ZipArchive as a class, not a callable function.
+const { ZipArchive } = require('archiver');
 const root = path.resolve(__dirname, '..');
 const dist = path.join(root, 'dist');
 const outputFile = path.join(dist, 'attendance-lambda.zip');
@@ -18,7 +19,7 @@ for (const essential of ['app.js', 'lambda.js', 'db/pool.js',
   }
 }
 const target = fs.createWriteStream(outputFile);
-const zip = archiver('zip', { zlib: { level: 7 } });
+const zip = new ZipArchive({ zlib: { level: 7 } });
 target.on('close', () => {
   console.log('Lambda package ready: dist/attendance-lambda.zip (' +
     (zip.pointer() / 1024 / 1024).toFixed(2) + ' MB)');
