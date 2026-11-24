@@ -165,10 +165,23 @@ try {
     '--statement-id','hader-attendance-api-gateway',
     '--action','lambda:InvokeFunction','--principal','apigateway.amazonaws.com',
     '--source-arn',"arn:aws:execute-api:${region}:${account}:${apiId}/*")
-  $permissionOutput = & aws @permissionArgs '--endpoint-url' $endpoint '--no-cli-pager' '--output' 'json' 2>&1
-  if ($LASTEXITCODE -ne 0 -and ($permissionOutput | Out-String) -notmatch
-      'ResourceConflictException|already exists') {
-    throw 'Could not grant API Gateway permission to invoke Lambda.'
+  # On the second deployment AWS returns a ResourceConflictException because
+  # the permission already exists. PowerShell 5.1 treats native stderr as a
+  # terminating error under Stop; temporarily relax handling for this call.
+  $previousErrorActionPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = 'Continue'
+    $permissionOutput = & aws @permissionArgs '--endpoint-url' $endpoint '--no-cli-pager' '--output' 'json' 2>&1
+    $permissionExitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+  }
+  if ($permissionExitCode -ne 0) {
+    if (($permissionOutput | Out-String) -match 'ResourceConflictException|already exists') {
+      Write-Host ' API Gateway invoke permission already exists'
+    } else {
+      throw 'Could not grant API Gateway permission to invoke Lambda.'
+    }
   }
 
   Write-Host '[7/7] Output deployment details' -ForegroundColor Cyan
