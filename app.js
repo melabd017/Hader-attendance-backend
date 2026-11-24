@@ -8,6 +8,25 @@ const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '10kb' }));
 
+// Structured request log for AWS CloudWatch (also useful for local debugging).
+// Log only method, route, status and elapsed time. Never log JWTs, bodies or URLs
+// containing query parameters, since those can carry sensitive data.
+app.use((req, res, next) => {
+  const started = process.hrtime.bigint();
+  res.on('finish', () => {
+    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+    const route = req.route?.path || req.path;
+    console.info(JSON.stringify({
+      event: 'attendance_http_request',
+      method: req.method,
+      path: route,
+      status: res.statusCode,
+      duration_ms: Math.round(elapsedMs)
+    }));
+  });
+  next();
+});
+
 // Allow only your explicitly listed frontend origins to call the API in browsers.
 // No wildcard CORS for the authenticated organizer/attendee endpoints.
 const allowedOrigins = (process.env.CORS_ORIGINS || 'http://localhost:3003')
